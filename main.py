@@ -5,6 +5,7 @@ from threading import Thread
 from flask import Flask
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys # THE NEW KEYBOARD TRICK!
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -80,7 +81,6 @@ def trigger_action(message, action_type):
     driver = None 
 
     try:
-        # THE FIX: This tells Render to automatically download Chrome for you!
         options = webdriver.ChromeOptions()
         options.add_argument('--headless=new') 
         options.add_argument('--no-sandbox')
@@ -88,7 +88,6 @@ def trigger_action(message, action_type):
         options.add_argument('--disable-gpu') 
 
         driver = webdriver.Chrome(options=options) 
-        
         driver.get(ERP_LOGIN_URL)
         wait = WebDriverWait(driver, 15)
         
@@ -99,14 +98,14 @@ def trigger_action(message, action_type):
         password_input = driver.find_element(By.XPATH, "//input[@placeholder='Password']")
         password_input.send_keys(user_session[chat_id]['password'])
         
-        send_otp_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'Send OTP')]")
-        send_otp_btn.click()
+        # THE FIX: Press the digital "Enter" key to submit the form!
+        password_input.send_keys(Keys.RETURN)
         
         # Clear any old OTP from memory
         user_session[chat_id]['current_otp'] = None
         
         # Ask user for OTP
-        msg = bot.send_message(chat_id, "📩 *OTP Sent!* \nPlease check your Email/SMS and type the OTP here:", parse_mode="Markdown")
+        msg = bot.send_message(chat_id, "📩 *Portal activated!* \nIf the portal sent you an OTP, please type it here:", parse_mode="Markdown")
         bot.register_next_step_handler(msg, capture_otp_input)
         
         # Synchronous Wait Loop (Holds the browser open)
@@ -124,11 +123,11 @@ def trigger_action(message, action_type):
         bot.send_message(chat_id, "🔐 *Verifying OTP and fetching data...*", parse_mode="Markdown")
         otp_code = user_session[chat_id]['current_otp']
         
-        otp_input = driver.find_element(By.XPATH, "//input[@placeholder='Enter OTP']")
+        # Safely find the OTP box and press Enter again
+        otp_input = wait.until(EC.presence_of_element_located((By.XPATH, "//input[contains(@placeholder, 'OTP') or contains(@name, 'otp')]")))
         otp_input.send_keys(otp_code)
+        otp_input.send_keys(Keys.RETURN)
         
-        submit_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'SIGN IN')]")
-        submit_btn.click()
         time.sleep(5) 
         
         # Route to the correct scraper
