@@ -1,189 +1,198 @@
+"""
+👑 ULTRA-PREMIUM ANONYMOUS CHAT BOT
+Architecture: Async Python + python-telegram-bot + MongoDB + AIOHTTP
+Designed for Render.com Free Tier + UptimeRobot integration.
+"""
+
 import os
-import time
-import telebot
-from threading import Thread
-from flask import Flask
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys # THE NEW KEYBOARD TRICK!
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import asyncio
+import logging
+from datetime import datetime
+from aiohttp import web
+from motor.motor_asyncio import AsyncIOMotorClient
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    CallbackQueryHandler, filters, ContextTypes
+)
 
-# ==========================================
-# CONFIGURATION & SETUP
-# ==========================================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-ERP_LOGIN_URL = "https://erp.sandipuniversity.com/"
+# --- CONFIGURATION & LOGGING ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-user_session = {}
+# You will set these in Render's Environment Variables later
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+MONGO_URI = os.getenv("MONGO_URI", "YOUR_MONGODB_URI_HERE")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789")) # Replace with your Telegram ID
+PORT = int(os.getenv("PORT", "8080"))
 
-app = Flask(__name__)
+# --- DATABASE MANAGEMENT (MongoDB) ---
+class Database:
+    def __init__(self, uri: str):
+        self.client = AsyncIOMotorClient(uri)
+        self.db = self.client.omegle_bot
+        self.users = self.db.users
+        self.active_chats = self.db.active_chats
+        self.waiting_queue = self.db.waiting_queue
 
-@app.route('/')
-def home():
-    return "Interactive Manual OTP Bot is awake!"
+    async def get_user(self, user_id: int):
+        return await self.users.find_one({"user_id": user_id})
 
-def keep_alive():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    async def register_user(self, user_id: int, username: str):
+        user = await self.get_user(user_id)
+        if not user:
+            await self.users.insert_one({
+                "user_id": user_id,
+                "username": username,
+                "is_premium": False,
+                "chats_completed": 0,
+                "joined_date": datetime.utcnow()
+            })
+            return True
+        return False
 
-# ==========================================
-# TELEGRAM BOT COMMANDS
-# ==========================================
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome_text = (
-        "🎓 *SANDIP UNIVERSITY ASSISTANT* 🎓\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 *Step 1:* Type /login to save your credentials.\n"
-        "📌 *Step 2:* Request your data.\n\n"
-        "👉 /attendance - Fetch your latest attendance\n"
-        "👉 /assignment - Check for new assignments"
-    )
-    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+    async def make_premium(self, user_id: int):
+        result = await self.users.update_one(
+            {"user_id": user_id}, 
+            {"$set": {"is_premium": True}}
+        )
+        return result.modified_count > 0
 
-@bot.message_handler(commands=['login'])
-def login_start(message):
-    msg = bot.reply_to(message, "👤 *Setup Step 1/2*\n\nPlease enter your *PRN Number*:", parse_mode="Markdown")
-    bot.register_next_step_handler(msg, process_prn_step)
+db = Database(MONGO_URI)
 
-def process_prn_step(message):
-    chat_id = message.chat.id
-    user_session[chat_id] = {'prn': message.text}
-    msg = bot.reply_to(message, "🔒 *Setup Step 2/2*\n\nPlease enter your *Password*:", parse_mode="Markdown")
-    bot.register_next_step_handler(msg, process_password_step)
+# --- TELEGRAM HANDLERS ---
 
-def process_password_step(message):
-    chat_id = message.chat.id
-    user_session[chat_id]['password'] = message.text 
-    try:
-        bot.delete_message(chat_id, message.message_id)
-    except:
-        pass 
-    bot.send_message(chat_id, "✅ *Credentials saved!* \nYou can now use /attendance or /assignment.", parse_mode="Markdown")
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command 1: The Premium Welcome Screen"""
+    user = update.effective_user
+    await db.register_user(user.id, user.username)
+    
+    user_data = await db.get_user(user.id)
+    is_vip = user_data.get("is_premium", False)
 
-def capture_otp_input(message):
-    """Grabs the OTP from the user and saves it so the waiting browser can use it."""
-    chat_id = message.chat.id
-    user_session[chat_id]['current_otp'] = message.text
+    if is_vip:
+        text = (
+            f"👑 **Welcome back, VIP {user.first_name}!**\n\n"
+            "Your Ultra-Premium status is Active. You have priority queue access "
+            "and all filters are unlocked."
+        )
+        keyboard = [
+            [InlineKeyboardButton("🚀 VIP Connect (Zero Wait)", callback_data="cmd_vip_connect")],
+            [InlineKeyboardButton("⚙️ VIP Dashboard", callback_data="cmd_dashboard")]
+        ]
+    else:
+        text = (
+            f"🌍 **Welcome to the Ultimate Anonymous Network!**\n\n"
+            "Thousands of users are chatting right now.\n"
+            "Ready to meet a stranger?"
+        )
+        keyboard = [
+            [InlineKeyboardButton("💬 Start Random Chat", callback_data="cmd_chat")],
+            [InlineKeyboardButton("💎 Unlock ULTRA Premium", callback_data="cmd_upgrade")]
+        ]
 
-# ==========================================
-# THE CORE BROWSER ENGINE
-# ==========================================
-def trigger_action(message, action_type):
-    chat_id = message.chat.id
-    if chat_id not in user_session or 'password' not in user_session[chat_id]:
-        bot.reply_to(message, "⚠️ Please type /login first to set your credentials!", parse_mode="Markdown")
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def add_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin Command: Upgrades a user to Premium"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔️ Access Denied. You are not an Admin.")
         return
 
-    bot.send_message(chat_id, "⏳ *Waking up the portal...* Please wait.", parse_mode="Markdown")
-    
-    driver = None 
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: /add_premium <user_id>")
+        return
 
     try:
-        options = webdriver.ChromeOptions()
-        options.add_argument('--headless=new') 
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu') 
-
-        driver = webdriver.Chrome(options=options) 
-        driver.get(ERP_LOGIN_URL)
-        wait = WebDriverWait(driver, 15)
-        
-        # 1. Enter Credentials
-        username_input = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Username']")))
-        username_input.send_keys(user_session[chat_id]['prn'])
-        
-        password_input = driver.find_element(By.XPATH, "//input[@placeholder='Password']")
-        password_input.send_keys(user_session[chat_id]['password'])
-        
-        # THE FIX: Press the digital "Enter" key to submit the form!
-        password_input.send_keys(Keys.RETURN)
-        
-        # Clear any old OTP from memory
-        user_session[chat_id]['current_otp'] = None
-        
-        # Ask user for OTP
-        msg = bot.send_message(chat_id, "📩 *Portal activated!* \nIf the portal sent you an OTP, please type it here:", parse_mode="Markdown")
-        bot.register_next_step_handler(msg, capture_otp_input)
-        
-        # Synchronous Wait Loop (Holds the browser open)
-        bot.send_message(chat_id, "_Waiting for your OTP (60 seconds)..._", parse_mode="Markdown")
-        timer = 60
-        while user_session[chat_id].get('current_otp') is None and timer > 0:
-            time.sleep(1)
-            timer -= 1
-            
-        if timer == 0:
-            bot.send_message(chat_id, "⏳ *Timeout!* You took too long to enter the OTP. Please try again.", parse_mode="Markdown")
-            return 
-            
-        # We got the OTP! Proceed with login.
-        bot.send_message(chat_id, "🔐 *Verifying OTP and fetching data...*", parse_mode="Markdown")
-        otp_code = user_session[chat_id]['current_otp']
-        
-        # Safely find the OTP box and press Enter again
-        otp_input = wait.until(EC.presence_of_element_located((By.XPATH, "//input[contains(@placeholder, 'OTP') or contains(@name, 'otp')]")))
-        otp_input.send_keys(otp_code)
-        otp_input.send_keys(Keys.RETURN)
-        
-        time.sleep(5) 
-        
-        # Route to the correct scraper
-        if action_type == 'attendance':
-            scrape_attendance(chat_id, driver)
-        elif action_type == 'assignment':
-            scrape_assignment(chat_id, driver)
-            
-    except Exception as e:
-        error_msg = str(e)[:300] 
-        bot.send_message(chat_id, f"❌ *System/Portal Error:* \n`{error_msg}`", parse_mode="Markdown")
-    finally:
-        if driver:
+        target_id = int(context.args[0])
+        success = await db.make_premium(target_id)
+        if success:
+            await update.message.reply_text(f"✅ User {target_id} is now a VIP Premium member!")
+            # Optionally notify the user
             try:
-                driver.quit()
-            except:
-                pass
+                await context.bot.send_message(
+                    chat_id=target_id, 
+                    text="🎉 **Congratulations!** An Admin has upgraded your account to **ULTRA PREMIUM**! Type /start to see your new dashboard.",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass # User might have blocked the bot
+        else:
+            await update.message.reply_text("❌ User not found in the database. Have they typed /start yet?")
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid User ID. It must be a number.")
 
-def scrape_attendance(chat_id, driver):
-    driver.get(ERP_LOGIN_URL + "attendance")
-    time.sleep(5)
-    total_percentage = driver.find_element(By.XPATH, "//tr[last()]/td[last()]").text
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Core Engine: Routes messages between strangers"""
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    # 1. Check if user is currently in a chat session
+    chat_session = await db.active_chats.find_one({"$or": [{"user1": user_id}, {"user2": user_id}]})
     
-    report = (
-        "📑 *OFFICIAL ATTENDANCE REPORT* 📑\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 *Student PRN:* `{user_session[chat_id]['prn']}`\n\n"
-        f"📈 *Total Attendance:* *{total_percentage}*\n\n"
-        "💡 _Tip: Maintain above 75% to avoid penalties!_"
-    )
-    bot.send_message(chat_id, report, parse_mode="Markdown")
+    if chat_session:
+        # Find the stranger's ID
+        stranger_id = chat_session["user2"] if chat_session["user1"] == user_id else chat_session["user1"]
+        
+        # Forward the message to the stranger
+        try:
+            await context.bot.send_message(chat_id=stranger_id, text=f"👤 Stranger: {text}")
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
+            await update.message.reply_text("⚠️ The stranger disconnected unexpectedly. Type /chat to find someone new.")
+            await db.active_chats.delete_one({"_id": chat_session["_id"]})
+    else:
+        await update.message.reply_text("You are not in a chat! Type /chat to find a stranger.")
 
-def scrape_assignment(chat_id, driver):
-    driver.get(ERP_LOGIN_URL + "assignments")
-    time.sleep(5)
-    title = driver.find_element(By.XPATH, "//table/tbody/tr[1]/td[2]").text
-    date = driver.find_element(By.XPATH, "//table/tbody/tr[1]/td[3]").text
+# --- WEB SERVER FOR UPTIMEROBOT (Keeps bot awake 24/7) ---
+async def handle_ping(request):
+    """UptimeRobot will visit this URL every 14 minutes"""
+    return web.Response(text="Bot is awake and running smoothly! 🟢")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"Web server started on port {PORT}")
+
+# --- MAIN RUNNER ---
+async def main():
+    # 1. Start the web server in the background
+    await start_web_server()
+
+    # 2. Build the Telegram Bot
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # 3. Register Commands
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("add_premium", add_premium_command))
     
-    report = (
-        "🔔 *LATEST ASSIGNMENT UPDATE* 🔔\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📖 *Subject:* {title}\n"
-        f"📅 *Upload Date:* {date}\n\n"
-        "⚠️ _Please check the portal for submission deadlines!_"
-    )
-    bot.send_message(chat_id, report, parse_mode="Markdown")
+    # 4. Register Message Router (Must be last)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-@bot.message_handler(commands=['attendance'])
-def handle_attendance(message):
-    trigger_action(message, 'attendance')
-
-@bot.message_handler(commands=['assignment'])
-def handle_assignment(message):
-    trigger_action(message, 'assignment')
+    # 5. Start Polling
+    logger.info("Bot is starting...")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    # Keep the application running
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    Thread(target=keep_alive).start()
-    bot.infinity_polling()
+    # Prevent asyncio crash on Windows environments
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
+        
