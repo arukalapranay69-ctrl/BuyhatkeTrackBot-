@@ -5,10 +5,8 @@ from threading import Thread
 from flask import Flask
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ==========================================
 # CONFIGURATION & SETUP
@@ -79,15 +77,17 @@ def trigger_action(message, action_type):
 
     bot.send_message(chat_id, "⏳ *Waking up the portal...* Please wait.", parse_mode="Markdown")
     
-    driver = None # Define driver here so the 'finally' block can close it safely
+    driver = None 
 
     try:
-        # THE FIX 1: Browser setup is now INSIDE the safety net!
+        # THE FIX: This tells Render to automatically download Chrome for you!
         options = webdriver.ChromeOptions()
-        options.add_argument('--headless')
+        options.add_argument('--headless=new') 
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        options.add_argument('--disable-gpu') 
+
+        driver = webdriver.Chrome(options=options) 
         
         driver.get(ERP_LOGIN_URL)
         wait = WebDriverWait(driver, 15)
@@ -109,7 +109,7 @@ def trigger_action(message, action_type):
         msg = bot.send_message(chat_id, "📩 *OTP Sent!* \nPlease check your Email/SMS and type the OTP here:", parse_mode="Markdown")
         bot.register_next_step_handler(msg, capture_otp_input)
         
-        # THE FIX 2: Synchronous Wait Loop (Holds the browser open)
+        # Synchronous Wait Loop (Holds the browser open)
         bot.send_message(chat_id, "_Waiting for your OTP (60 seconds)..._", parse_mode="Markdown")
         timer = 60
         while user_session[chat_id].get('current_otp') is None and timer > 0:
@@ -138,7 +138,6 @@ def trigger_action(message, action_type):
             scrape_assignment(chat_id, driver)
             
     except Exception as e:
-        # THE FIX 3: If it crashes, it will text you the EXACT error code!
         error_msg = str(e)[:300] 
         bot.send_message(chat_id, f"❌ *System/Portal Error:* \n`{error_msg}`", parse_mode="Markdown")
     finally:
@@ -188,4 +187,4 @@ def handle_assignment(message):
 if __name__ == "__main__":
     Thread(target=keep_alive).start()
     bot.infinity_polling()
-        
+    
