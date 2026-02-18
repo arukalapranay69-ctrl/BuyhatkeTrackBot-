@@ -29,7 +29,7 @@ app_server = Flask(__name__)
 
 @app_server.route('/')
 def home():
-    return "Status: Operational. Master Price Tracker Engine is active."
+    return "Status: Operational. Unified Omni-Tracker Engine is active."
 
 def run_health_server():
     """Binds to Render's required port to prevent forceful shutdown."""
@@ -80,8 +80,8 @@ def extract_price(url: str) -> float:
             logger.error(f"Amazon direct scrape failed: {e}")
             return None
 
-    # --- FLIPKART: SCRAPER API PROXY ROUTING ---
-    elif "flipkart" in url_lower or "fktr" in url_lower:
+    # --- FLIPKART & BLINKIT: SCRAPER API PROXY ROUTING ---
+    elif "flipkart" in url_lower or "fktr" in url_lower or "blinkit" in url_lower:
         SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
         if not SCRAPER_API_KEY:
             logger.error("CRITICAL: SCRAPER_API_KEY is missing. Add it to Render Environment Variables.")
@@ -93,7 +93,7 @@ def extract_price(url: str) -> float:
             temp_response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
             clean_url = temp_response.url.split('?')[0] # Strips tracking parameters
             
-            # STEP 2: Send clean URL to ScraperAPI to execute JavaScript
+            # STEP 2: Send clean URL to ScraperAPI to execute JavaScript (Crucial for Blinkit)
             api_endpoint = "http://api.scraperapi.com"
             params = {
                 "api_key": SCRAPER_API_KEY,
@@ -105,12 +105,13 @@ def extract_price(url: str) -> float:
             response.raise_for_status()
             soup = BeautifulSoup(response.content, "html.parser")
             
-            # STEP 3: Find the price using known classes
+            # STEP 3: Find the price using known frontend classes (Flipkart mostly)
             price_element = soup.find("div", class_=re.compile(r"Nx9bqj|_30jeq3|_16Jk6d"))
             if price_element:
                 return float(re.sub(r'[^\d.]', '', price_element.text))
             
-            # STEP 4: Bulletproof Fallback. Find exact Rupee text anywhere on the page.
+            # STEP 4: Bulletproof Fallback for Blinkit and modified Flipkart pages.
+            # Hunts for exact Rupee text anywhere on the page structure.
             for tag in soup.find_all(["div", "span"]):
                 text = tag.get_text(strip=True)
                 if re.match(r'^₹\s*[\d,]+(\.\d+)?$', text):
@@ -119,7 +120,7 @@ def extract_price(url: str) -> float:
             return None
             
         except Exception as e:
-            logger.error(f"Flipkart ScraperAPI scrape failed: {e}")
+            logger.error(f"Proxy scrape failed for {clean_url}: {e}")
             return None
             
     return None
@@ -131,7 +132,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = (
         "Greetings! I am your automated Price Tracking Engine. 📊\n\n"
         "**How to operate:**\n"
-        "Simply **paste an Amazon or Flipkart link** directly into this chat. "
+        "Simply **paste an Amazon, Flipkart, or Blinkit link** directly into this chat. "
         "I will intercept it, analyze the current market price, and prompt you for a target.\n\n"
         "To view your active surveillance list, type `/list`."
     )
@@ -184,12 +185,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url = match.group(0)
         url_lower = url.lower()
         
+        # Identity Platform
         if "amazon" in url_lower or "amzn" in url_lower: 
             platform = "Amazon"
         elif "flipkart" in url_lower or "fktr" in url_lower: 
             platform = "Flipkart"
+        elif "blinkit" in url_lower:
+            platform = "Blinkit"
         else:
-            await update.message.reply_text("System rejection: I am exclusively programmed for Amazon and Flipkart domains.")
+            await update.message.reply_text("System rejection: I am exclusively programmed for Amazon, Flipkart, and Blinkit domains.")
             return
 
         processing_msg = await update.message.reply_text(f"🔍 Initializing handshake with {platform} servers. Please wait...")
@@ -204,7 +208,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if current_price:
             prompt += f"Current market valuation is **₹{current_price:,.2f}**.\n\n"
         else:
-            prompt += "High-security firewall detected. I could not fetch the live price, but I can still monitor it via background proxies.\n\n"
+            prompt += "High-security firewall or location-lock detected. I could not fetch the live price, but I can still monitor it via background proxies.\n\n"
             
         prompt += "Please reply with your **Target Price** (e.g., 999):"
         
@@ -212,7 +216,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # PHASE 3: Unrecognized Input
-    await update.message.reply_text("Awaiting input: Please paste a valid Amazon or Flipkart URL.")
+    await update.message.reply_text("Awaiting input: Please paste a valid Amazon, Flipkart, or Blinkit URL.")
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.chat_id
@@ -283,4 +287,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+                    
