@@ -23,16 +23,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# 2. CLOUD INFRASTRUCTURE (RENDER HEALTH CHECK)
+# 2. CLOUD INFRASTRUCTURE (RENDER HEALTH SERVER)
 # ==========================================
 app_server = Flask(__name__)
 
 @app_server.route('/')
 def home():
-    return "Status: Operational. Hybrid Price Tracker Engine is active."
+    return "Status: Operational. Master Price Tracker Engine is active."
 
 def run_health_server():
-    """Binds to Render's required port so the cloud provider doesn't kill our bot."""
+    """Binds to Render's required port to prevent forceful shutdown."""
     app_server.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 # ==========================================
@@ -60,71 +60,62 @@ async def post_init(application: Application):
 # 4. HYBRID DATA EXTRACTION ENGINE
 # ==========================================
 def extract_price(url: str) -> float:
-    """
-    Intelligent router: 
-    - Amazon links get processed locally to save API credits.
-    - Flipkart links get routed through ScraperAPI to bypass enterprise firewalls.
-    """
     url_lower = url.lower()
     
     # --- AMAZON: DIRECT LOCAL SCRAPING ---
     if "amazon" in url_lower or "amzn" in url_lower:
-        session = requests.Session()
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
         try:
-            response = session.get(url, headers=headers, timeout=20, allow_redirects=True)
+            response = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, "html.parser")
             
             price_element = soup.find("span", {"class": "a-price-whole"})
             if price_element:
-                clean_price = re.sub(r'[^\d.]', '', price_element.text)
-                return float(clean_price)
+                return float(re.sub(r'[^\d.]', '', price_element.text))
             return None
         except Exception as e:
             logger.error(f"Amazon direct scrape failed: {e}")
             return None
 
-    # --- FLIPKART: SCRAPER API ROUTING ---
+    # --- FLIPKART: SCRAPER API PROXY ROUTING ---
     elif "flipkart" in url_lower or "fktr" in url_lower:
         SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
         if not SCRAPER_API_KEY:
-            logger.error("CRITICAL: SCRAPER_API_KEY is missing. Flipkart tracking disabled.")
+            logger.error("CRITICAL: SCRAPER_API_KEY is missing. Add it to Render Environment Variables.")
             return None
             
-        # We pass parameters cleanly to ensure URL encoding is handled perfectly
-        api_endpoint = "http://api.scraperapi.com"
-        params = {
-            "api_key": SCRAPER_API_KEY,
-            "url": url,
-            "render": "true" # Forces the proxy to run JavaScript
-        }
-        
         try:
-            # 60-second timeout because headless browsers take time to render JS
+            # STEP 1: Un-shorten mobile links safely using a Desktop User-Agent
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"}
+            temp_response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+            clean_url = temp_response.url.split('?')[0] # Strips tracking parameters
+            
+            # STEP 2: Send clean URL to ScraperAPI to execute JavaScript
+            api_endpoint = "http://api.scraperapi.com"
+            params = {
+                "api_key": SCRAPER_API_KEY,
+                "url": clean_url,
+                "render": "true" 
+            }
+            
             response = requests.get(api_endpoint, params=params, timeout=60)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, "html.parser")
             
-            price_text = None
-            price_element = soup.find("div", class_=re.compile(r"Nx9bqj|hl05eU|_30jeq3"))
+            # STEP 3: Find the price using known classes
+            price_element = soup.find("div", class_=re.compile(r"Nx9bqj|_30jeq3|_16Jk6d"))
+            if price_element:
+                return float(re.sub(r'[^\d.]', '', price_element.text))
             
-            if not price_element:
-                for div in soup.find_all("div"):
-                    if div.text and re.match(r'^₹[\d,]+$', div.text.strip()):
-                        price_text = div.text
-                        break
-            else:
-                price_text = price_element.text
-                
-            if price_text:
-                clean_price = re.sub(r'[^\d.]', '', price_text)
-                return float(clean_price)
+            # STEP 4: Bulletproof Fallback. Find exact Rupee text anywhere on the page.
+            for tag in soup.find_all(["div", "span"]):
+                text = tag.get_text(strip=True)
+                if re.match(r'^₹\s*[\d,]+(\.\d+)?$', text):
+                    return float(re.sub(r'[^\d.]', '', text))
+                    
             return None
             
         except Exception as e:
@@ -201,7 +192,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("System rejection: I am exclusively programmed for Amazon and Flipkart domains.")
             return
 
-        processing_msg = await update.message.reply_text(f"🔍 Initializing handshake with {platform} servers...")
+        processing_msg = await update.message.reply_text(f"🔍 Initializing handshake with {platform} servers. Please wait...")
         current_price = extract_price(url)
         
         context.user_data['awaiting_price'] = True
@@ -292,4 +283,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+            
