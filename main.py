@@ -1,198 +1,114 @@
-"""
-👑 ULTRA-PREMIUM ANONYMOUS CHAT BOT
-Architecture: Async Python + python-telegram-bot + MongoDB + AIOHTTP
-Designed for Render.com Free Tier + UptimeRobot integration.
-"""
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-import os
-import asyncio
-import logging
-from datetime import datetime
-from aiohttp import web
-from motor.motor_asyncio import AsyncIOMotorClient
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, filters, ContextTypes
-)
+# --- Configuration ---
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 
-# --- CONFIGURATION & LOGGING ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# --- State Management ---
+# In a production app, you would use a database like Redis. 
+# For this tutorial, we will use simple in-memory variables.
+waiting_users = []       # List of chat_ids waiting for a partner
+active_chats = {}        # Dictionary mapping user_id -> partner_id
 
-# You will set these in Render's Environment Variables later
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-MONGO_URI = os.getenv("MONGO_URI", "YOUR_MONGODB_URI_HERE")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789")) # Replace with your Telegram ID
-PORT = int(os.getenv("PORT", "8080"))
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a welcome message when a user starts the bot."""
+    await update.message.reply_text(
+        "Welcome to Stranger Chat! 🕵️‍♂️\n\n"
+        "Commands:\n"
+        "/search - Find a random stranger to talk to\n"
+        "/stop - End your current chat or leave the queue"
+    )
 
-# --- DATABASE MANAGEMENT (MongoDB) ---
-class Database:
-    def __init__(self, uri: str):
-        self.client = AsyncIOMotorClient(uri)
-        self.db = self.client.omegle_bot
-        self.users = self.db.users
-        self.active_chats = self.db.active_chats
-        self.waiting_queue = self.db.waiting_queue
+async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Puts the user in the queue or pairs them up."""
+    user_id = update.message.chat_id
 
-    async def get_user(self, user_id: int):
-        return await self.users.find_one({"user_id": user_id})
-
-    async def register_user(self, user_id: int, username: str):
-        user = await self.get_user(user_id)
-        if not user:
-            await self.users.insert_one({
-                "user_id": user_id,
-                "username": username,
-                "is_premium": False,
-                "chats_completed": 0,
-                "joined_date": datetime.utcnow()
-            })
-            return True
-        return False
-
-    async def make_premium(self, user_id: int):
-        result = await self.users.update_one(
-            {"user_id": user_id}, 
-            {"$set": {"is_premium": True}}
-        )
-        return result.modified_count > 0
-
-db = Database(MONGO_URI)
-
-# --- TELEGRAM HANDLERS ---
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command 1: The Premium Welcome Screen"""
-    user = update.effective_user
-    await db.register_user(user.id, user.username)
-    
-    user_data = await db.get_user(user.id)
-    is_vip = user_data.get("is_premium", False)
-
-    if is_vip:
-        text = (
-            f"👑 **Welcome back, VIP {user.first_name}!**\n\n"
-            "Your Ultra-Premium status is Active. You have priority queue access "
-            "and all filters are unlocked."
-        )
-        keyboard = [
-            [InlineKeyboardButton("🚀 VIP Connect (Zero Wait)", callback_data="cmd_vip_connect")],
-            [InlineKeyboardButton("⚙️ VIP Dashboard", callback_data="cmd_dashboard")]
-        ]
-    else:
-        text = (
-            f"🌍 **Welcome to the Ultimate Anonymous Network!**\n\n"
-            "Thousands of users are chatting right now.\n"
-            "Ready to meet a stranger?"
-        )
-        keyboard = [
-            [InlineKeyboardButton("💬 Start Random Chat", callback_data="cmd_chat")],
-            [InlineKeyboardButton("💎 Unlock ULTRA Premium", callback_data="cmd_upgrade")]
-        ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def add_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin Command: Upgrades a user to Premium"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔️ Access Denied. You are not an Admin.")
+    # Check if they are already busy
+    if user_id in active_chats:
+        await update.message.reply_text("You are already in a chat! Use /stop to leave it first.")
+        return
+    if user_id in waiting_users:
+        await update.message.reply_text("You are already in the waiting queue. Please wait...")
         return
 
-    if not context.args:
-        await update.message.reply_text("⚠️ Usage: /add_premium <user_id>")
-        return
-
-    try:
-        target_id = int(context.args[0])
-        success = await db.make_premium(target_id)
-        if success:
-            await update.message.reply_text(f"✅ User {target_id} is now a VIP Premium member!")
-            # Optionally notify the user
-            try:
-                await context.bot.send_message(
-                    chat_id=target_id, 
-                    text="🎉 **Congratulations!** An Admin has upgraded your account to **ULTRA PREMIUM**! Type /start to see your new dashboard.",
-                    parse_mode='Markdown'
-                )
-            except Exception:
-                pass # User might have blocked the bot
-        else:
-            await update.message.reply_text("❌ User not found in the database. Have they typed /start yet?")
-    except ValueError:
-        await update.message.reply_text("⚠️ Invalid User ID. It must be a number.")
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Core Engine: Routes messages between strangers"""
-    user_id = update.effective_user.id
-    text = update.message.text
-
-    # 1. Check if user is currently in a chat session
-    chat_session = await db.active_chats.find_one({"$or": [{"user1": user_id}, {"user2": user_id}]})
-    
-    if chat_session:
-        # Find the stranger's ID
-        stranger_id = chat_session["user2"] if chat_session["user1"] == user_id else chat_session["user1"]
+    # If someone is waiting, pair them up!
+    if waiting_users:
+        partner_id = waiting_users.pop(0)
         
-        # Forward the message to the stranger
-        try:
-            await context.bot.send_message(chat_id=stranger_id, text=f"👤 Stranger: {text}")
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}")
-            await update.message.reply_text("⚠️ The stranger disconnected unexpectedly. Type /chat to find someone new.")
-            await db.active_chats.delete_one({"_id": chat_session["_id"]})
+        # Link both users to each other
+        active_chats[user_id] = partner_id
+        active_chats[partner_id] = user_id
+        
+        # Notify both users
+        await context.bot.send_message(chat_id=user_id, text="Stranger found! Say hi 👋")
+        await context.bot.send_message(chat_id=partner_id, text="Stranger found! Say hi 👋")
     else:
-        await update.message.reply_text("You are not in a chat! Type /chat to find a stranger.")
+        # No one is waiting, so join the queue
+        waiting_users.append(user_id)
+        await update.message.reply_text("Waiting for a partner to join...")
 
-# --- WEB SERVER FOR UPTIMEROBOT (Keeps bot awake 24/7) ---
-async def handle_ping(request):
-    """UptimeRobot will visit this URL every 14 minutes"""
-    return web.Response(text="Bot is awake and running smoothly! 🟢")
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ends the current chat or removes the user from the waiting queue."""
+    user_id = update.message.chat_id
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"Web server started on port {PORT}")
+    if user_id in waiting_users:
+        waiting_users.remove(user_id)
+        await update.message.reply_text("You left the waiting queue.")
+        return
 
-# --- MAIN RUNNER ---
-async def main():
-    # 1. Start the web server in the background
-    await start_web_server()
+    if user_id in active_chats:
+        partner_id = active_chats[user_id]
+        
+        # Unlink both users
+        del active_chats[user_id]
+        del active_chats[partner_id]
+        
+        # Notify both users
+        await update.message.reply_text("You have disconnected from the chat.")
+        await context.bot.send_message(chat_id=partner_id, text="The stranger has disconnected. Use /search to find a new one.")
+        return
 
-    # 2. Build the Telegram Bot
-    application = Application.builder().token(BOT_TOKEN).build()
+    await update.message.reply_text("You are not currently in a chat or queue.")
 
-    # 3. Register Commands
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("add_premium", add_premium_command))
+async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Secretly copies messages between paired users."""
+    user_id = update.message.chat_id
+
+    if user_id in active_chats:
+        partner_id = active_chats[user_id]
+        try:
+            # We use copy_message instead of forward_message to ensure anonymity.
+            # This strips the "Forwarded from" tag and supports images, voice notes, and videos!
+            await context.bot.copy_message(
+                chat_id=partner_id,
+                from_chat_id=user_id,
+                message_id=update.message.message_id
+            )
+        except Exception:
+            # If sending fails (e.g., the partner blocked the bot), end the chat gracefully.
+            await update.message.reply_text("Failed to send message. Your partner might have blocked the bot.")
+            del active_chats[user_id]
+            if partner_id in active_chats:
+                del active_chats[partner_id]
+    else:
+        await update.message.reply_text("You are not chatting with anyone! Use /search to find a stranger.")
+
+def main():
+    # Initialize the bot application
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Register commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("search", search))
+    app.add_handler(CommandHandler("stop", stop))
     
-    # 4. Register Message Router (Must be last)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    # Register a message handler to catch all standard text/media messages
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, forward_message))
 
-    # 5. Start Polling
-    logger.info("Bot is starting...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    # Keep the application running
-    await asyncio.Event().wait()
+    # Turn the bot on
+    print("Bot is running! Press Ctrl+C to stop.")
+    app.run_polling()
 
 if __name__ == "__main__":
-    # Prevent asyncio crash on Windows environments
-    if os.name == 'nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    main()
     
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
-        
