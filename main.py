@@ -32,7 +32,6 @@ def home():
     return "Telegram Price Tracker Bot is Alive and Running!"
 
 def run_health_server():
-    # disabled debug and reloader to prevent threading conflicts
     app_server.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 # ==========================================
@@ -53,7 +52,6 @@ async def init_db():
         await db.commit()
     logger.info("Database initialized successfully.")
 
-# BUG FIX: We now use PTB's native post_init hook to safely run async startup tasks
 async def post_init(application: Application):
     await init_db()
     logger.info("Startup complete. Bot is now active.")
@@ -70,16 +68,20 @@ def extract_price(url: str) -> float:
     try:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
+        
+        # If the link is a shortlink, getting response.url gives us the full expanded link
+        final_url = response.url.lower()
         soup = BeautifulSoup(response.content, "html.parser")
         
         price_text = None
         
-        if "amazon" in url.lower():
+        # Now checking for both full words and short links
+        if "amazon" in final_url or "amzn" in final_url:
             price_element = soup.find("span", {"class": "a-price-whole"})
             if price_element:
                 price_text = price_element.text
                 
-        elif "flipkart" in url.lower():
+        elif "flipkart" in final_url or "fktr" in final_url:
             price_element = soup.find("div", class_=re.compile(r"Nx9bqj|hl05eU"))
             if price_element:
                 price_text = price_element.text
@@ -117,9 +119,14 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_price = float(context.args[1])
         user_id = update.message.chat_id
         
+        url_lower = url.lower()
         platform = "Unknown"
-        if "amazon" in url.lower(): platform = "Amazon"
-        elif "flipkart" in url.lower(): platform = "Flipkart"
+        
+        # Updated link validation
+        if "amazon" in url_lower or "amzn" in url_lower: 
+            platform = "Amazon"
+        elif "flipkart" in url_lower or "fktr" in url_lower: 
+            platform = "Flipkart"
         else:
             await update.message.reply_text("⚠️ Please provide a valid Amazon or Flipkart link.")
             return
@@ -195,24 +202,19 @@ def main():
         logger.error("Please set your TELEGRAM_TOKEN environment variable!")
         return
 
-    # 1. Start Flask Health Check in background thread
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    # 2. Build Bot and attach the async post_init hook so the database builds properly
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
-    # 3. Register Handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("track", track_command))
     application.add_handler(CommandHandler("list", list_command))
 
-    # 4. Schedule Job
     job_queue = application.job_queue
     job_queue.run_repeating(check_prices_job, interval=10800, first=10)
 
     logger.info("Bot is starting polling...")
     
-    # 5. Start Polling
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
