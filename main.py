@@ -1,124 +1,237 @@
 import os
+import re
+import logging
 import threading
+import aiosqlite
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask
-from pymongo import MongoClient
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- 1. Environment Variables ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
-AMAZON_TAG = os.getenv("AMAZON_TAG")
-FLIPKART_ID = os.getenv("FLIPKART_ID")
-# Render automatically assigns a PORT. Default to 10000 if testing locally.
-PORT = int(os.getenv("PORT", 10000))
+# ==========================================
+# 1. CONFIGURATION & SETUP
+# ==========================================
+# Best Practice: Use Environment Variables on Render instead of hardcoding tokens
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "REPLACE_WITH_YOUR_BOT_TOKEN")
+PORT = int(os.environ.get("PORT", 10000)) # Render assigns a dynamic port
+DB_NAME = "price_tracker.db"
 
-# --- 2. Database Setup (MongoDB) ---
-client = MongoClient(MONGO_URI)
-db = client["price_tracker_db"]
-trackings = db["trackings"]
+# Enable professional logging to catch any background issues
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# --- 3. Flask Dummy Server (Keeps Render Awake) ---
-app = Flask(__name__)
+# ==========================================
+# 2. RENDER HEALTH CHECK SERVER
+# ==========================================
+# This prevents Render from crashing the app due to "Port Binding Timeout"
+app_server = Flask(__name__)
 
-@app.route('/')
+@app_server.route('/')
 def home():
-    return "Bot is awake and running!"
+    return "Telegram Price Tracker Bot is Alive and Running!"
 
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT)
+def run_health_server():
+    app_server.run(host='0.0.0.0', port=PORT)
 
-# --- 4. Bot Commands ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "Hello! I am your Price Tracker Bot. 🛒\n\n"
-        "Send me a link and a target price.\n"
-        "Format: /track <url> <target_price>\n"
-        "Example: /track https://amazon.in/dp/B08... 499"
-    )
-    await update.message.reply_text(welcome_text)
-
-async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        args = context.args
-        if len(args) < 2:
-            await update.message.reply_text("⚠️ Usage: /track <url> <target_price>")
-            return
-        
-        url = args[0]
-        target_price = float(args[1])
-        chat_id = update.message.chat_id
-        
-        # Save tracking request to database
-        trackings.insert_one({
-            "chat_id": chat_id,
-            "url": url,
-            "target_price": target_price
-        })
-        
-        await update.message.reply_text(f"✅ Tracking started! I will alert you when the price drops to or below ₹{target_price}.")
-    except ValueError:
-        await update.message.reply_text("⚠️ Error: Make sure your target price is a number.")
-
-# --- 5. Scraping & Affiliate Link Logic ---
-def generate_affiliate_link(url):
-    """
-    Placeholder logic: You will need to extract the ASIN or PID 
-    and reconstruct a clean link with your tags.
-    """
-    if "amazon" in url:
-        # Example of appending a tag, though extracting ASIN is better
-        return f"{url}&tag={AMAZON_TAG}" if "?" in url else f"{url}?tag={AMAZON_TAG}"
-    elif "flipkart" in url:
-        return f"{url}&affid={FLIPKART_ID}" if "?" in url else f"{url}?affid={FLIPKART_ID}"
-    return url
-
-async def check_prices(context: ContextTypes.DEFAULT_TYPE):
-    """Background task that runs periodically to check prices."""
-    for item in trackings.find():
-        url = item["url"]
-        
-        # TODO: Implement your Beautifulsoup/requests scraping logic here
-        # current_price = scrape_price_from_web(url)
-        
-        # --- MOCK DATA FOR TESTING ---
-        # We are simulating a price drop to trigger the alert
-        current_price = item["target_price"] - 10 
-        
-        if current_price <= item["target_price"]:
-            aff_link = generate_affiliate_link(url)
-            message = (
-                f"🚨 **PRICE DROP ALERT!** 🚨\n\n"
-                f"The price has dropped to ₹{current_price}!\n"
-                f"🛒 Buy it here: {aff_link}"
+# ==========================================
+# 3. DATABASE MANAGEMENT
+# ==========================================
+async def init_db():
+    """Initializes the SQLite database asynchronously."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trackers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                url TEXT,
+                target_price REAL,
+                platform TEXT
             )
-            
-            # Send alert to user
-            await context.bot.send_message(chat_id=item["chat_id"], text=message, parse_mode='Markdown')
-            
-            # Remove item from tracking so it doesn't spam them forever
-            trackings.delete_one({"_id": item["_id"]})
+        """)
+        await db.commit()
+    logger.info("Database initialized successfully.")
 
-# --- 6. Main Execution ---
+# ==========================================
+# 4. WEB SCRAPING LOGIC
+# ==========================================
+def extract_price(url: str) -> float:
+    """Scrapes Amazon or Flipkart to find the current price."""
+    # We use realistic headers to avoid getting immediately blocked
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        
+        price_text = None
+        
+        # Amazon Logic
+        if "amazon" in url.lower():
+            # Looks for Amazon's whole price tag
+            price_element = soup.find("span", {"class": "a-price-whole"})
+            if price_element:
+                price_text = price_element.text
+                
+        # Flipkart Logic
+        elif "flipkart" in url.lower():
+            # Flipkart uses changing obfuscated classes, usually starting with ₹
+            price_element = soup.find("div", class_=re.compile(r"Nx9bqj|hl05eU"))
+            if price_element:
+                price_text = price_element.text
+                
+        if price_text:
+            # Clean the string (remove ₹, commas, spaces) and convert to float
+            clean_price = re.sub(r'[^\d.]', '', price_text)
+            return float(clean_price)
+            
+        return None
+        
+    except Exception as e:
+        logger.error(f"Failed to scrape {url}: {e}")
+        return None
+
+# ==========================================
+# 5. BOT COMMAND HANDLERS
+# ==========================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Greets the user and explains how to use the bot."""
+    welcome_message = (
+        "👋 Welcome to the Price Tracker Bot!\n\n"
+        "I can track prices on Amazon and Flipkart.\n"
+        "Usage: `/track <url> <target_price>`\n"
+        "Example: `/track https://amazon.in/product 999`\n\n"
+        "Use `/list` to see your tracked items."
+    )
+    await update.message.reply_text(welcome_message, parse_mode='Markdown')
+
+async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves a new tracking request from the user."""
+    try:
+        # Validate user input
+        if len(context.args) != 2:
+            await update.message.reply_text("⚠️ Invalid format.\nUsage: `/track <url> <target_price>`", parse_mode='Markdown')
+            return
+            
+        url = context.args[0]
+        target_price = float(context.args[1])
+        user_id = update.message.chat_id
+        
+        platform = "Unknown"
+        if "amazon" in url.lower(): platform = "Amazon"
+        elif "flipkart" in url.lower(): platform = "Flipkart"
+        else:
+            await update.message.reply_text("⚠️ Please provide a valid Amazon or Flipkart link.")
+            return
+
+        # Fetch current price to ensure link works
+        current_price = extract_price(url)
+        if current_price is None:
+            await update.message.reply_text("⚠️ Could not read the price right now (the site might be blocking bots). I will still save it and try tracking it in the background!")
+        
+        # Save to database
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "INSERT INTO trackers (user_id, url, target_price, platform) VALUES (?, ?, ?, ?)",
+                (user_id, url, target_price, platform)
+            )
+            await db.commit()
+            
+        msg = f"✅ Tracking added!\n**Platform:** {platform}\n**Target:** ₹{target_price}"
+        if current_price:
+            msg += f"\n**Current Price:** ₹{current_price}"
+            
+        await update.message.reply_text(msg, parse_mode='Markdown')
+        
+    except ValueError:
+        await update.message.reply_text("⚠️ Target price must be a valid number.")
+    except Exception as e:
+        logger.error(f"Error in track_command: {e}")
+        await update.message.reply_text("⚠️ An unexpected error occurred.")
+
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows the user all their tracked items."""
+    user_id = update.message.chat_id
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, platform, target_price FROM trackers WHERE user_id = ?", (user_id,)) as cursor:
+            rows = await cursor.fetchall()
+            
+    if not rows:
+        await update.message.reply_text("You are not tracking any items right now.")
+        return
+        
+    msg = "📋 **Your Tracked Items:**\n\n"
+    for row in rows:
+        msg += f"ID: {row[0]} | {row[1]} | Target: ₹{row[2]}\n"
+        
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+# ==========================================
+# 6. BACKGROUND SCHEDULER (THE WORKER)
+# ==========================================
+async def check_prices_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs automatically to check prices in the database."""
+    logger.info("Running scheduled price check...")
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, user_id, url, target_price, platform FROM trackers") as cursor:
+            trackers = await cursor.fetchall()
+            
+        for tracker in trackers:
+            item_id, user_id, url, target, platform = tracker
+            current_price = extract_price(url)
+            
+            if current_price and current_price <= target:
+                # Notify User
+                alert_msg = f"🎉 **PRICE DROP ALERT!** 🎉\n\nYour {platform} item has dropped to **₹{current_price}** (Target was ₹{target}).\n\nBuy here: {url}"
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=alert_msg, parse_mode='Markdown')
+                    # Remove from database once target is hit
+                    await db.execute("DELETE FROM trackers WHERE id = ?", (item_id,))
+                    await db.commit()
+                except Exception as e:
+                    logger.error(f"Failed to send message to {user_id}: {e}")
+
+# ==========================================
+# 7. MAIN STARTUP LOGIC
+# ==========================================
 def main():
-    # Start Flask server in a separate background thread
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
+    if TELEGRAM_TOKEN == "REPLACE_WITH_YOUR_BOT_TOKEN":
+        logger.error("Please set your TELEGRAM_TOKEN environment variable!")
+        return
 
-    # Start the Telegram Bot
+    # Start the Render Health Check Server in a separate daemon thread
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    # Build the Telegram Bot Application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("track", track))
-    
-    # Run the price checker background job every 1 hour (3600 seconds)
-    job_queue = application.job_queue
-    job_queue.run_repeating(check_prices, interval=3600, first=10)
 
-    # Start listening for messages
-    print("Bot is polling...")
-    application.run_polling()
+    # Register Handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("track", track_command))
+    application.add_handler(CommandHandler("list", list_command))
+
+    # Initialize the database
+    # Since PTB handles async lifecycle, we can run this directly using the event loop
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(init_db())
+
+    # Schedule the background price checker to run every 3 hours (10800 seconds)
+    # We don't check every 5 minutes to avoid getting IP banned by Amazon
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_prices_job, interval=10800, first=10)
+
+    logger.info("Bot is starting polling...")
+    # Start the bot
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
