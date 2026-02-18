@@ -2,7 +2,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- Configuration ---
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "7986134997:AAGLmZwwj5G9gCT5ZRMC4DuOuTWeeKE7-zo"
 
 # --- State Management ---
 # In a production app, you would use a database like Redis. 
